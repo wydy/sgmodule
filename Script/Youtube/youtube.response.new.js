@@ -1,23 +1,33 @@
-// ==================== 1. 环境适配与工具层 ($) ====================
+// ==================== 1. 高性能环境适配与工具层 ($) ====================
 const $ = {
     log: (msg) => console.log(`[YT-Purge] ${msg}`),
     getResponseBody: () => {
-        if (typeof $response !== "undefined" && $response.body) {
-            if (typeof $response.body === "string") {
-                return new Uint8Array(Array.from($response.body, c => c.charCodeAt(0)));
+        if (typeof $response === "undefined" || !$response.body) return null;
+        if ($response.body instanceof Uint8Array) return $response.body;
+        if ($response.body instanceof ArrayBuffer) return new Uint8Array($response.body);
+        if (typeof $response.body === "string") {
+            const len = $response.body.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = $response.body.charCodeAt(i) & 0xff;
             }
-            return $response.body;
+            return bytes;
         }
         return null;
     },
     done: (obj) => {
         if (typeof $done !== "undefined") {
             if (obj.body && obj.body instanceof Uint8Array) {
-                // 某些环境要求返回二进制或用二进制字符串兼容
                 if (typeof $environment !== "undefined" && $environment['qx-size']) {
                     $done({ body: obj.body.buffer });
                 } else {
-                    $done({ body: String.fromCharCode.apply(null, obj.body) });
+                    // 核心修复：采用高效分块（Chunked）转换，每块 8KB，彻底杜绝 64KB 引起的栈溢出崩溃
+                    let str = "";
+                    const chunk = 8192;
+                    for (let i = 0; i < obj.body.length; i += chunk) {
+                        str += String.fromCharCode.apply(null, obj.body.subarray(i, i + chunk));
+                    }
+                    $done({ body: str });
                 }
             } else {
                 $done(obj);
@@ -26,7 +36,7 @@ const $ = {
     }
 };
 
-// ==================== 2. ProtoBuf 核心解析与编码器 ====================
+// ==================== 2. 64位无损 ProtoBuf 核心解析与编码器 ====================
 class ProtoMessage {
     constructor(buffer) {
         this.fields = [];
@@ -37,7 +47,8 @@ class ProtoMessage {
         const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
         let offset = 0;
 
-        const readVarint = () => {
+        // 安全读取 32 位以内的 Varint（仅用于解析 Key 和 Length 长度，绝不用于数据字段）
+        const readVarint32 = () => {
             let result = 0, shift = 0, b;
             do {
                 b = view.getUint8(offset++);
@@ -48,15 +59,18 @@ class ProtoMessage {
         };
 
         while (offset < buffer.byteLength) {
-            const key = readVarint();
+            const key = readVarint32();
             const tag = key >> 3;
             const type = key & 0x07;
 
             let val;
             if (type === 0) { // Varint
-                val = readVarint();
+                // 核心创新：非破坏性原字节保留，不转成数值，完美保全所有 64 位大整数
+                const start = offset;
+                while (view.getUint8(offset++) & 0x80) {}
+                val = buffer.subarray(start, offset);
             } else if (type === 2) { // Length-delimited
-                const len = readVarint();
+                const len = readVarint32();
                 val = buffer.subarray(offset, offset + len);
                 offset += len;
             } else if (type === 1) { // Fixed64
@@ -66,7 +80,7 @@ class ProtoMessage {
                 val = buffer.subarray(offset, offset + 4);
                 offset += 4;
             } else {
-                throw new Error(`未知的 WireType: ${type} 在位移处: ${offset}`);
+                throw new Error(`未知 WireType: ${type} 位移: ${offset}`);
             }
             this.fields.push({ tag, type, val });
         }
@@ -74,7 +88,7 @@ class ProtoMessage {
 
     encode() {
         const parts = [];
-        const writeVarint = (val) => {
+        const writeVarint32 = (val) => {
             const buf = [];
             while (val > 127) {
                 buf.push((val & 0x7F) | 0x80);
@@ -85,11 +99,15 @@ class ProtoMessage {
         };
 
         for (const f of this.fields) {
-            parts.push(writeVarint((f.tag << 3) | f.type));
+            parts.push(writeVarint32((f.tag << 3) | f.type));
             if (f.type === 0) {
-                parts.push(writeVarint(f.val));
+                if (f.val instanceof Uint8Array) {
+                    parts.push(f.val); // 保持原样输出，不损坏原数据
+                } else {
+                    parts.push(writeVarint32(f.val));
+                }
             } else if (f.type === 2) {
-                parts.push(writeVarint(f.val.byteLength));
+                parts.push(writeVarint32(f.val.byteLength));
                 parts.push(f.val);
             } else {
                 parts.push(f.val);
@@ -124,23 +142,19 @@ class ProtoMessage {
     }
 }
 
-// ==================== 3. YouTube 业务逻辑处理器 ====================
+// ==================== 3. YouTube 精准业务逻辑层 ====================
 class YouTubeProcessor {
-    /**
-     * 核心路由：解析 /v1/player 接口 (控制播放器权限与广告)
-     */
+    // 净化 /v1/player (控制后台播放画中画与原生视频贴片广告)
     static processPlayer(buffer) {
         try {
             const msg = new ProtoMessage(buffer);
-            // 移除视频流中的原生广告投放与追踪
-            msg.filter(new Set([2, 3, 8]));
+            msg.filter(new Set([2, 3, 8])); // 剔除贴片投放流
             
-            // 解锁后台播放与画中画
             const playabilityStatusField = msg.find(7);
             if (playabilityStatusField && playabilityStatusField.type === 2) {
                 const statusMsg = new ProtoMessage(playabilityStatusField.val);
-                statusMsg.setVarint(1, 1); // 状态强行改为 1 (OK)
-                statusMsg.filter(new Set([2])); // 移除限制原因文本
+                statusMsg.setVarint(1, 1); // 强写状态为 OK (1)
+                statusMsg.filter(new Set([2])); // 净化区域或版权限制文本
                 playabilityStatusField.val = statusMsg.encode();
             }
             return msg.encode();
@@ -149,9 +163,7 @@ class YouTubeProcessor {
         }
     }
 
-    /**
-     * 修复版：通过特征探测，精准剥离首页广告与 Shorts
-     */
+    // 净化 /v1/browse 与 /v1/search (首页瀑布流、搜索流、订阅流广告与 Shorts)
     static purgeBrowse(buffer) {
         try {
             const msg = new ProtoMessage(buffer);
@@ -161,12 +173,10 @@ class YouTubeProcessor {
                 if (field.type === 2) {
                     if (field.tag === 1) {
                         const subMsg = new ProtoMessage(field.val);
-                        // 【特征探测】检查当前 Tag 1 内部是否包含真正的视频渲染器 Tag
                         const hasRenderers = subMsg.fields.some(f => (f.tag === 1 || f.tag === 2) && f.type === 2);
                         const hasTabs = subMsg.fields.some(f => f.tag === 3);
                         
                         if (hasRenderers && !hasTabs) {
-                            // 确定当前层为 richGridRenderer.contents (内容容器层)
                             const filteredFields = [];
                             let gridChanged = false;
                             
@@ -176,9 +186,8 @@ class YouTubeProcessor {
                                     const content = itemMsg.find(1);
                                     if (content && content.type === 2) {
                                         const contentMsg = new ProtoMessage(content.val);
-                                        // 过滤广告节点
                                         if (contentMsg.find(5) || contentMsg.find(7)) {
-                                            gridChanged = true;
+                                            gridChanged = true; // 广告节点
                                             continue;
                                         }
                                     }
@@ -187,9 +196,8 @@ class YouTubeProcessor {
                                     const content = sectionMsg.find(1);
                                     if (content && content.type === 2) {
                                         const contentMsg = new ProtoMessage(content.val);
-                                        // 过滤 Shorts 货架
                                         if (contentMsg.find(8)) {
-                                            gridChanged = true;
+                                            gridChanged = true; // Shorts 货架
                                             continue;
                                         }
                                     }
@@ -202,7 +210,6 @@ class YouTubeProcessor {
                                 isModified = true;
                             }
                         } else {
-                            // 未探测到内容特征，判定为普通骨架层，安全向下递归
                             const cleaned = YouTubeProcessor.purgeBrowse(field.val);
                             if (cleaned.length !== field.val.length) {
                                 field.val = cleaned;
@@ -210,7 +217,6 @@ class YouTubeProcessor {
                             }
                         }
                     } else if (field.tag === 3 || field.tag === 4) {
-                        // 其他已知骨架标签，直接递归
                         const cleaned = YouTubeProcessor.purgeBrowse(field.val);
                         if (cleaned.length !== field.val.length) {
                             field.val = cleaned;
@@ -225,9 +231,7 @@ class YouTubeProcessor {
         }
     }
 
-    /**
-     * 修复版：针对 /v1/next (视频下方推荐流) 进行特征探测过滤，完美兼容 PiP 画中画
-     */
+    // 净化 /v1/next (视频播放页下方的相关推荐、评论区穿插广告与 Shorts)
     static purgeNext(buffer) {
         try {
             const msg = new ProtoMessage(buffer);
@@ -236,17 +240,13 @@ class YouTubeProcessor {
             for (const field of msg.fields) {
                 if (field.type === 2 && (field.tag === 1 || field.tag === 2)) {
                     const subMsg = new ProtoMessage(field.val);
-                    // 【特征探测】检查当前层是否包含推荐流特有的广告或 Shorts 标签 (3, 11, 12)
                     const hasAdsOrShorts = subMsg.fields.some(f => f.tag === 3 || f.tag === 11 || f.tag === 12);
                     
                     if (hasAdsOrShorts) {
-                        // 确定为 secondaryResultsRenderer.results 容器层，执行黑名单剔除
-                        // 绝不乱删白名单外的内容，以此保护 PiP 画中画所需的 playerOverlays 控制图层
                         subMsg.fields = subMsg.fields.filter(f => f.tag !== 3 && f.tag !== 11 && f.tag !== 12);
                         field.val = subMsg.encode();
                         isModified = true;
                     } else {
-                        // 骨架层，继续向下递归
                         const cleaned = YouTubeProcessor.purgeNext(field.val);
                         if (cleaned.length !== field.val.length) {
                             field.val = cleaned;
@@ -276,19 +276,19 @@ class YouTubeProcessor {
         let modifiedBody = null;
 
         if (url.includes("/v1/player")) {
-            $.log("正在解锁播放器权限与视频广告...");
+            $.log("正在处理播放器响应 (解锁权限/去广告)...");
             modifiedBody = YouTubeProcessor.processPlayer(rawBody);
         } 
         else if (url.includes("/v1/browse")) {
-            $.log("正在精准净化首页/订阅流 (移除广告与 Shorts)...");
+            $.log("正在处理首页/订阅流瀑布流 (移除广告/Shorts)...");
             modifiedBody = YouTubeProcessor.purgeBrowse(rawBody);
         } 
         else if (url.includes("/v1/next")) {
-            $.log("正在精准净化相关视频推荐流 (移除广告与 Shorts)...");
+            $.log("正在处理相关推荐流 (移除广告/Shorts)...");
             modifiedBody = YouTubeProcessor.purgeNext(rawBody);
         } 
         else if (url.includes("/v1/search")) {
-            $.log("正在精准净化搜索结果流...");
+            $.log("正在处理搜索结果流...");
             modifiedBody = YouTubeProcessor.purgeBrowse(rawBody);
         }
 
@@ -298,10 +298,7 @@ class YouTubeProcessor {
             $.done({});
         }
     } catch (err) {
-        $.log(`运行时发生异常: ${err.message}`);
+        $.log(`运行时捕获严重异常: ${err.message}`);
         $.done({});
     }
 })();
-
-// 映射别名兼容
-YouTubeProcessor.crunchFeeds = YouTubeProcessor.purgeFeeds;
