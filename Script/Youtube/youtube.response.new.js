@@ -156,61 +156,99 @@ class YouTubeProcessor {
      */
     static processPlayer(buffer) {
         const msg = new ProtoMessage(buffer);
-        
-        // 1. 移除视频流中的原生广告投放与追踪
-        // Tag 2: adPlacements (广告配置), Tag 3: adSlots (广告位), Tag 8: playbackTracking (广告追踪)
+        // 移除视频流中的原生广告投放与追踪
         msg.filter(new Set([2, 3, 8]));
         
-        // 2. 解锁后台播放与画中画 (修改播放状态声明)
-        // Tag 7: playabilityStatus
+        // 解锁后台播放与画中画
         const playabilityStatusField = msg.find(7);
         if (playabilityStatusField && playabilityStatusField.type === 2) {
             const statusMsg = new ProtoMessage(playabilityStatusField.val);
-            
-            // 将 status (Tag 1) 强行设定为 1 (代表 OK，允许正常渲染与后台播放)
-            statusMsg.setVarint(1, 1);
-            
-            // 剔除任何可能导致客户端弹出“此视频无法在后台播放”或区域限制的报错文本 (Tag 2: reason)
-            statusMsg.filter(new Set([2]));
-            
-            // 重新写回父节点
+            statusMsg.setVarint(1, 1); // 状态强行改为 1 (OK)
+            statusMsg.filter(new Set([2])); // 移除限制原因文本
             playabilityStatusField.val = statusMsg.encode();
         }
-        
         return msg.encode();
     }
 
     /**
-     * 核心路由：深度递归净化 /v1/browse (首页、订阅) 与 /v1/next (推荐列表)
+     * 修复版：针对 /v1/browse (首页、订阅、搜索) 进行精确路径过滤
      */
-    static purgeFeeds(buffer) {
+    static purgeBrowse(buffer) {
         try {
             const msg = new ProtoMessage(buffer);
-            let isModified = false;
             
-            // 命中信息流广告容器、大黄蜂横幅推广以及 Shorts 短视频组件的底层 Tag
-            // 根据 InnerTube 常规映射，Tag 9, 10, 14, 50, 51 常用于存放此类货架渲染器
-            const targetBlacklist = new Set([9, 10, 14, 50, 51]);
-            
-            const originCount = msg.fields.length;
-            msg.filter(targetBlacklist);
-            if (msg.fields.length !== originCount) isModified = true;
-            
-            // 深度遍历：如果子节点是 Length-delimited 且有内容，递归进去清洗
             for (const field of msg.fields) {
-                if (field.type === 2 && field.val.length > 0) {
-                    const cleanedSubBytes = YouTubeProcessor.purgeFeeds(field.val);
-                    // 如果内容发生变化，说明子节点中裁切了广告，将其写回
-                    if (cleanedSubBytes !== field.val) {
-                        field.val = cleanedSubBytes;
-                        isModified = true;
+                // 【安全路径保护】只在特定的结构骨架 Tag (1:contents, 3:tabs, 4:content) 中向下递归
+                if (field.type === 2 && (field.tag === 1 || field.tag === 3 || field.tag === 4)) {
+                    field.val = YouTubeProcessor.purgeBrowse(field.val);
+                }
+                
+                // 精准定位到 richGridRenderer.contents (Tag 1) 信息流骨干阵列
+                if (field.tag === 1 && field.type === 2) {
+                    const gridMsg = new ProtoMessage(field.val);
+                    const filteredFields = [];
+                    
+                    for (const item of gridMsg.fields) {
+                        // 1. 过滤普通信息流格子 (richItemRenderer)
+                        if (item.tag === 1 && item.type === 2) {
+                            const itemMsg = new ProtoMessage(item.val);
+                            const contentField = itemMsg.find(1); // content 节点
+                            if (contentField && contentField.type === 2) {
+                                const contentMsg = new ProtoMessage(contentField.val);
+                                // 判定：若不包含正常视频(Tag 1)或触发了广告节点(Tag 5, 7)，则执行剔除
+                                if (!contentMsg.find(1) || contentMsg.find(5) || contentMsg.find(7)) {
+                                    continue; 
+                                }
+                            }
+                        }
+                        // 2. 过滤全宽组合货架 (richSectionRenderer，如 Shorts、活动横幅)
+                        else if (item.tag === 2 && item.type === 2) {
+                            const sectionMsg = new ProtoMessage(item.val);
+                            const contentField = sectionMsg.find(1);
+                            if (contentField && contentField.type === 2) {
+                                const contentMsg = new ProtoMessage(contentField.val);
+                                // 判定：若包含 reelShelfRenderer (Tag 8: Shorts 聚合货架)，则整个栏目剔除
+                                if (contentMsg.find(8)) {
+                                    continue; 
+                                }
+                            }
+                        }
+                        filteredFields.push(item);
                     }
+                    gridMsg.fields = filteredFields;
+                    field.val = gridMsg.encode();
                 }
             }
-            
-            return isModified ? msg.encode() : buffer;
+            return msg.encode();
         } catch (e) {
-            // 如果遇到纯文本 String 节点引发解析报错，安全放行，不破坏原数据
+            return buffer; // 发生意外时安全回滚
+        }
+    }
+
+    /**
+     * 修复版：针对 /v1/next (视频下方推荐流) 进行精准结构拦截
+     */
+    static purgeNext(buffer) {
+        try {
+            const msg = new ProtoMessage(buffer);
+            
+            for (const field of msg.fields) {
+                // 【安全路径保护】仅穿梭于推荐流骨架 (1:contents, 2:secondaryResults)
+                if (field.type === 2 && (field.tag === 1 || field.tag === 2)) {
+                    field.val = YouTubeProcessor.purgeNext(field.val);
+                }
+                
+                // 精准定位到 secondaryResultsRenderer.results (Tag 1) 推荐列表容器
+                if (field.tag === 1 && field.type === 2) {
+                    const resultsMsg = new ProtoMessage(field.val);
+                    // 严格白名单过滤：只保留真正的推荐视频(Tag 1: compactVideoRenderer) 与 加载更多按钮(Tag 2)
+                    // 直接在二进制流中抹除 Tag 3 (推荐流中的 Shorts 货架) 以及 Tag 11, 12 (推荐流混合广告)
+                    resultsMsg.fields = resultsMsg.fields.filter(item => item.tag === 1 || item.tag === 2);
+                    field.val = resultsMsg.encode();
+                }
+            }
+            return msg.encode();
+        } catch (e) {
             return buffer;
         }
     }
@@ -230,12 +268,21 @@ class YouTubeProcessor {
         let modifiedBody = null;
 
         if (url.includes("/v1/player")) {
-            $.log("正在处理播放器数据 (/v1/player)...");
+            $.log("正在解锁播放器权限与去除视频广告...");
             modifiedBody = YouTubeProcessor.processPlayer(rawBody);
         } 
-        else if (url.includes("/v1/browse") || url.includes("/v1/next") || url.includes("/v1/search")) {
-            $.log(`正在净化流媒体数据 (${url.split('/v1/')[1].split('?')[0]})...`);
-            modifiedBody = YouTubeProcessor.crunchFeeds(rawBody); // 调用深度清洗
+        else if (url.includes("/v1/browse")) {
+            $.log("正在精准净化首页/订阅流 (移除广告与 Shorts)...");
+            modifiedBody = YouTubeProcessor.purgeBrowse(rawBody);
+        } 
+        else if (url.includes("/v1/next")) {
+            $.log("正在精准净化相关视频推荐流 (移除广告与 Shorts)...");
+            modifiedBody = YouTubeProcessor.purgeNext(rawBody);
+        } 
+        else if (url.includes("/v1/search")) {
+            $.log("正在精准净化搜索结果流...");
+            // 搜索结果结构与 browse 骨架高度一致，复用安全路由净化
+            modifiedBody = YouTubeProcessor.purgeBrowse(rawBody);
         }
 
         if (modifiedBody) {
@@ -244,8 +291,7 @@ class YouTubeProcessor {
             $.done({});
         }
     } catch (err) {
-        $.log(`处理时发生致命异常: ${err.message}`);
-        // 异常捕获必须执行空done放行，否则会导致 YouTube 客户端出现网络错误、无限菊花
+        $.log(`运行时发生异常: ${err.message}`);
         $.done({});
     }
 })();
