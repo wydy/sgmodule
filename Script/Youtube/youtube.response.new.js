@@ -171,100 +171,83 @@ class YouTubeProcessor {
     }
 
     /**
-     * 修复版：针对 /v1/browse (首页、订阅、搜索) 进行非破坏性黑名单过滤
+     * 修复版：针对 /v1/browse (首页、订阅、搜索) 进行精确路径过滤
      */
     static purgeBrowse(buffer) {
         try {
             const msg = new ProtoMessage(buffer);
-            let isModified = false;
             
-            // 1. 安全向下纵深骨架层，不改动同级任何其他控制节点
             for (const field of msg.fields) {
+                // 【安全路径保护】只在特定的结构骨架 Tag (1:contents, 3:tabs, 4:content) 中向下递归
                 if (field.type === 2 && (field.tag === 1 || field.tag === 3 || field.tag === 4)) {
-                    const cleaned = YouTubeProcessor.purgeBrowse(field.val);
-                    if (cleaned.length !== field.val.length) {
-                        field.val = cleaned;
-                        isModified = true;
+                    field.val = YouTubeProcessor.purgeBrowse(field.val);
+                }
+                
+                // 精准定位到 richGridRenderer.contents (Tag 1) 信息流骨干阵列
+                if (field.tag === 1 && field.type === 2) {
+                    const gridMsg = new ProtoMessage(field.val);
+                    const filteredFields = [];
+                    
+                    for (const item of gridMsg.fields) {
+                        // 1. 过滤普通信息流格子 (richItemRenderer)
+                        if (item.tag === 1 && item.type === 2) {
+                            const itemMsg = new ProtoMessage(item.val);
+                            const contentField = itemMsg.find(1); // content 节点
+                            if (contentField && contentField.type === 2) {
+                                const contentMsg = new ProtoMessage(contentField.val);
+                                // 判定：若不包含正常视频(Tag 1)或触发了广告节点(Tag 5, 7)，则执行剔除
+                                if (!contentMsg.find(1) || contentMsg.find(5) || contentMsg.find(7)) {
+                                    continue; 
+                                }
+                            }
+                        }
+                        // 2. 过滤全宽组合货架 (richSectionRenderer，如 Shorts、活动横幅)
+                        else if (item.tag === 2 && item.type === 2) {
+                            const sectionMsg = new ProtoMessage(item.val);
+                            const contentField = sectionMsg.find(1);
+                            if (contentField && contentField.type === 2) {
+                                const contentMsg = new ProtoMessage(contentField.val);
+                                // 判定：若包含 reelShelfRenderer (Tag 8: Shorts 聚合货架)，则整个栏目剔除
+                                if (contentMsg.find(8)) {
+                                    continue; 
+                                }
+                            }
+                        }
+                        filteredFields.push(item);
                     }
+                    gridMsg.fields = filteredFields;
+                    field.val = gridMsg.encode();
                 }
             }
-
-            // 2. 采用【非破坏性过滤器】：只将确认是广告或Shorts的元素剔除，其余兄弟节点(如芯片栏、刷新状态)完美保留
-            const filteredFields = [];
-            let gridChanged = false;
-
-            for (const field of msg.fields) {
-                if (field.tag === 1 && field.type === 2) { // richItemRenderer (普通信息流格子)
-                    const itemMsg = new ProtoMessage(field.val);
-                    const content = itemMsg.find(1);
-                    if (content && content.type === 2) {
-                        const contentMsg = new ProtoMessage(content.val);
-                        // 如果命中明确的广告特征节点 (Tag 5 或 7)，将其剔除
-                        if (contentMsg.find(5) || contentMsg.find(7)) {
-                            gridChanged = true;
-                            continue; 
-                        }
-                    }
-                } 
-                else if (field.tag === 2 && field.type === 2) { // richSectionRenderer (全宽货架组合)
-                    const sectionMsg = new ProtoMessage(field.val);
-                    const content = sectionMsg.find(1);
-                    if (content && content.type === 2) {
-                        const contentMsg = new ProtoMessage(content.val);
-                        // 如果命中 reelShelfRenderer (Tag 8: Shorts短视频组件)，则切除整条货架
-                        if (contentMsg.find(8)) {
-                            gridChanged = true;
-                            continue; 
-                        }
-                    }
-                }
-                // 非广告/Shorts 元素，一律原样压入队列保留
-                filteredFields.push(field);
-            }
-
-            if (gridChanged) {
-                msg.fields = filteredFields;
-                isModified = true;
-            }
-
-            return isModified ? msg.encode() : buffer;
+            return msg.encode();
         } catch (e) {
-            return buffer;
+            return buffer; // 发生意外时安全回滚
         }
     }
 
     /**
-     * 修复版：针对 /v1/next (视频下方推荐流) 进行非破坏性精准拦截
+     * 修复版：针对 /v1/next (视频下方推荐流) 进行精准结构拦截
      */
     static purgeNext(buffer) {
         try {
             const msg = new ProtoMessage(buffer);
-            let isModified = false;
-
-            // 1. 安全向下纵深追踪推荐流路径 (仅限骨架 Tag 1 和 2)
+            
             for (const field of msg.fields) {
+                // 【安全路径保护】仅穿梭于推荐流骨架 (1:contents, 2:secondaryResults)
                 if (field.type === 2 && (field.tag === 1 || field.tag === 2)) {
-                    const cleaned = YouTubeProcessor.purgeNext(field.val);
-                    if (cleaned.length !== field.val.length) {
-                        field.val = cleaned;
-                        isModified = true;
-                    }
+                    field.val = YouTubeProcessor.purgeNext(field.val);
+                }
+                
+                // 精准定位到 secondaryResultsRenderer.results (Tag 1) 推荐列表容器
+                if (field.tag === 1 && field.type === 2) {
+                    const resultsMsg = new ProtoMessage(field.val);
+                    // 严格白名单过滤：只保留真正的推荐视频(Tag 1: compactVideoRenderer) 与 加载更多按钮(Tag 2)
+                    // 直接在二进制流中抹除 Tag 3 (推荐流中的 Shorts 货架) 以及 Tag 11, 12 (推荐流混合广告)
+                    resultsMsg.fields = resultsMsg.fields.filter(item => item.tag === 1 || item.tag === 2);
+                    field.val = resultsMsg.encode();
                 }
             }
-
-            // 2. 在推荐列表容器层，执行精准黑名单过滤
-            // Tag 3: 推荐流夹带的 Shorts 货架 (reelShelfRenderer)
-            // Tag 11, 12: 推荐流中插播的各种推广与广告图层
-            const nextBlacklist = new Set([3, 11, 12]);
-            const hasTargetAd = msg.fields.some(f => nextBlacklist.has(f.tag));
-            
-            if (hasTargetAd) {
-                // 仅过滤掉黑名单内的广告/Shorts，无条件保留 playerOverlays(播放控制图层) 等关键同步节点
-                msg.fields = msg.fields.filter(f => !nextBlacklist.has(f.tag));
-                isModified = true;
-            }
-
-            return isModified ? msg.encode() : buffer;
+            return msg.encode();
         } catch (e) {
             return buffer;
         }
